@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
+from .shiftwise import ShiftWiseConv
 from .transformer import TransformerBlock
 
 __all__ = (
@@ -37,6 +38,8 @@ __all__ = (
     "C2fPSA",
     "C3Ghost",
     "C3k2",
+    "BottleneckSW",
+    "C3k2_SW",
     "C3x",
     "CBFuse",
     "CBLinear",
@@ -49,6 +52,7 @@ __all__ = (
     "RepC3",
     "RepNCSPELAN4",
     "RepVGGDW",
+    "ShiftWiseConv",
     "ResNetLayer",
     "SCDown",
     "TorchVision",
@@ -1081,6 +1085,35 @@ class C3k2(C2f):
         self.m = nn.ModuleList(
             C3k(self.c, self.c, 2, shortcut, g) if c3k else Bottleneck(self.c, self.c, shortcut, g) for _ in range(n)
         )
+
+
+class BottleneckSW(nn.Module):
+    """Bottleneck variant that swaps the spatial conv for ShiftWiseConv."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, e: float = 0.5):
+        """Initialize a ShiftWise bottleneck."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = ShiftWiseConv(c_, c2, k=5, s=1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the ShiftWise bottleneck."""
+        y = self.cv2(self.cv1(x))
+        return x + y if self.add else y
+
+
+class C3k2_SW(C2f):
+    """C3k2 variant backed by ShiftWise bottlenecks."""
+
+    def __init__(
+        self, c1: int, c2: int, n: int = 1, c3k: bool = False, e: float = 0.5, g: int = 1, shortcut: bool = True
+    ):
+        """Initialize ShiftWise-enabled C3k2 module."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        block = BottleneckSW if not c3k else C3k
+        self.m = nn.ModuleList(block(self.c, self.c, shortcut, e=1.0) for _ in range(n))
 
 
 class C3k(C3):

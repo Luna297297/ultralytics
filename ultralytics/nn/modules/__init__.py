@@ -36,6 +36,7 @@ from .block import (
     Attention,
     BNContrastiveHead,
     Bottleneck,
+    BottleneckSW,
     BottleneckCSP,
     C2f,
     C2fAttn,
@@ -43,6 +44,7 @@ from .block import (
     C2fPSA,
     C3Ghost,
     C3k2,
+    C3k2_SW,
     C3x,
     CBFuse,
     CBLinear,
@@ -101,6 +103,7 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
+from .shiftwise import ShiftWiseConv
 
 __all__ = (
     "AIFI",
@@ -125,6 +128,7 @@ __all__ = (
     "Attention",
     "BNContrastiveHead",
     "Bottleneck",
+    "BottleneckSW",
     "BottleneckCSP",
     "C2f",
     "C2fAttn",
@@ -132,6 +136,7 @@ __all__ = (
     "C2fPSA",
     "C3Ghost",
     "C3k2",
+    "C3k2_SW",
     "C3x",
     "CBFuse",
     "CBLinear",
@@ -170,6 +175,7 @@ __all__ = (
     "ResNetLayer",
     "SCDown",
     "Segment",
+    "ShiftWiseConv",
     "SpatialAttention",
     "TorchVision",
     "TransformerBlock",
