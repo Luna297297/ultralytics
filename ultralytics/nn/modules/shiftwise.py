@@ -76,8 +76,18 @@ class ShiftWiseConv(nn.Module):
         self._c2 = c2
         self._c1 = c1
 
+        # 檢查環境變數：如果設置了 SHIFTWISE_DISABLE=1，完全禁用 ShiftWise
+        import os
+        shiftwise_disabled = os.getenv("SHIFTWISE_DISABLE", "0") == "1"
+        
         # 動態檢查 ShiftWise CUDA 模組是否可用（每次初始化時重新檢查）
         self.use_shiftwise, shift_module = _check_shiftwise_available()
+        if shiftwise_disabled:
+            self.use_shiftwise = False
+            if not hasattr(self, '_disable_warned'):
+                print("⚠️  ShiftWise 已通過環境變數禁用 (SHIFTWISE_DISABLE=1)")
+                self._disable_warned = True
+        
         if self.use_shiftwise and shift_module is not None:
             # AddShift_mp_module 需要：c_in = c_out * nk，其中 nk = ceil(big_k / small_k)
             import math
@@ -260,6 +270,17 @@ class ShiftWiseConv(nn.Module):
                 # AddShift_mp_module.forward(x, b, hout, wout)
                 # 內部會計算 x_hin = hout + 2*extra_pad，應該等於我們的 h
                 try:
+                    # 驗證輸入參數
+                    if b <= 0 or hout <= 0 or wout <= 0:
+                        raise ValueError(f"Invalid parameters: b={b}, hout={hout}, wout={wout}")
+                    if x_expanded.shape[0] != b:
+                        raise ValueError(f"Batch size mismatch: x.shape[0]={x_expanded.shape[0]}, b={b}")
+                    if x_expanded.shape[1] != self.shift.c_in:
+                        raise ValueError(
+                            f"Channel mismatch: x.shape[1]={x_expanded.shape[1]}, "
+                            f"expected c_in={self.shift.c_in}"
+                        )
+                    
                     y1, y2, y3 = self.shift(x_expanded, b, hout, wout)
                 except RuntimeError as e:
                     # 如果 CUDA kernel 出錯，提供更詳細的錯誤信息
@@ -281,6 +302,28 @@ class ShiftWiseConv(nn.Module):
                         f"Output shape mismatch: expected {expected_shape}, "
                         f"got y1={y1.shape}, y2={y2.shape}, y3={y3.shape}"
                     )
+                
+                # 同步 CUDA 操作以檢查是否有錯誤（在相加之前）
+                torch.cuda.synchronize()
+                
+                # 檢查輸出張量是否有效
+                try:
+                    # 嘗試訪問張量的 shape 來檢查是否有效
+                    _ = y1.shape
+                    _ = y2.shape
+                    _ = y3.shape
+                except RuntimeError as e:
+                    # 如果張量無效，CUDA 上下文可能已損壞
+                    error_msg = str(e)
+                    if "CUDA" in error_msg or "cuda" in error_msg.lower():
+                        # 嘗試重置 CUDA 上下文
+                        try:
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                        except:
+                            pass
+                        raise RuntimeError(f"CUDA context corrupted after ShiftWise kernel: {error_msg}")
+                    raise
                 
                 # 確保輸出張量是連續的
                 result = y1 + y2 + y3
@@ -319,9 +362,30 @@ class ShiftWiseConv(nn.Module):
                     # 只在第一次出錯時打印警告，避免刷屏
                     if not hasattr(self, '_fallback_warned'):
                         print(f"⚠️  ShiftWise CUDA kernel error, falling back to standard conv: {error_msg}")
+                        print(f"   這可能是 CUDA kernel 與當前 PyTorch/CUDA 版本不相容")
+                        print(f"   建議：重新編譯 shift-wiseConv 或使用 fallback 模式")
                         self._fallback_warned = True
+                    
+                    # 嘗試清除 CUDA 錯誤狀態
+                    try:
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                    except:
+                        pass
+                    
+                    # 永久禁用 ShiftWise 以避免後續錯誤
+                    self.use_shiftwise = False
+                    self.shift = None
+                    
                     # 標記：因為錯誤而使用 fallback
                     self._path_used = 'fallback'
+                    
+                    # 確保輸入在正確的設備上
+                    if not x.is_cuda and torch.cuda.is_available():
+                        x = x.cuda()
+                    elif x.is_cuda and not torch.cuda.is_available():
+                        x = x.cpu()
+                    
                     return self.act(self.fallback_bn(self.fallback_conv(x)))
                 else:
                     raise
