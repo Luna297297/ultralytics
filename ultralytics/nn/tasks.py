@@ -1607,6 +1607,25 @@ def parse_model(d, ch, verbose=True):
                 legacy = False
                 if scale in "mlx":
                     args[3] = True
+                # For C3k2_SW: handle optional big_k and replace_both parameters
+                if m is C3k2_SW:
+                    # Parameter order after parse_model: (c1, c2, n, c3k, e, g, shortcut, big_k, replace_both)
+                    # Ensure all optional parameters have defaults if not provided in YAML
+                    # args currently has: [c1, c2, n, c3k, e, ...]
+                    # We need to ensure g, shortcut, big_k, replace_both are present
+                    while len(args) < 7:  # Ensure at least g is present
+                        if len(args) == 5:
+                            args.append(1)  # g (default)
+                        elif len(args) == 6:
+                            args.append(True)  # shortcut (default)
+                    # Add big_k if not present (must be > 3 per paper)
+                    if len(args) < 8:
+                        args.append(13)  # big_k (default, paper's minimum)
+                    elif not isinstance(args[7], (int, float)) or args[7] <= 3:
+                        args[7] = 13  # Ensure big_k > 3
+                    # Add replace_both if not present
+                    if len(args) < 9:
+                        args.append(True)  # replace_both (default)
             if m is A2C2f:
                 legacy = False
                 if scale in "lx":  # for L/X sizes

@@ -15,21 +15,42 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 class ShiftWiseConv(nn.Module):
-    """Conv module with ShiftWise CUDA support and full fallback."""
+    """ShiftWise convolution module following the paper's design.
+    
+    This module implements large receptive field convolution using small 3x3 kernels
+    with spatial shift patterns, as proposed in the ShiftWise paper.
+    
+    Args:
+        c1: Input channels
+        c2: Output channels
+        big_k: Equivalent large kernel size (M in paper). Must be >> 3 (paper uses 13-51).
+        small_k: Small kernel size, fixed to 3 per paper requirement.
+        s: Stride (currently only stride=1 is supported)
+        act: Activation function
+    """
 
-    def __init__(self, c1: int, c2: int, k: int = 5, s: int = 1, act: bool | nn.Module = True):
+    def __init__(
+        self, c1: int, c2: int, big_k: int = 13, small_k: int = 3, s: int = 1, act: bool | nn.Module = True
+    ):
         super().__init__()
         self.stride = s
         self.act = nn.SiLU() if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+        
+        # Paper requirement: small_k must be fixed to 3
+        if small_k != 3:
+            raise ValueError(f"small_k must be 3 per paper requirement, got {small_k}")
+        
+        # Paper requirement: big_k must be >> 3 to achieve large receptive field
+        if big_k <= 3:
+            raise ValueError(f"big_k must be > 3 to achieve large receptive field effect, got {big_k}")
 
-        padding = k // 2
-        self.fallback_conv = nn.Conv2d(c1, c2, k, s, padding, bias=False)
+        # Fallback conv uses big_k for padding (to match receptive field size)
+        padding = big_k // 2
+        self.fallback_conv = nn.Conv2d(c1, c2, big_k, s, padding, bias=False)
         self.fallback_bn = nn.BatchNorm2d(c2)
 
         self.use_shiftwise = HAS_SHIFTWISE
         if self.use_shiftwise:
-            big_k = max(k, 3)
-            small_k = 3 if big_k >= 3 else 1
             self.shift = AddShift_mp_module(big_k, small_k, c2, c1, group_in=1)
             self.shift_bn = nn.BatchNorm2d(c2)
         else:
