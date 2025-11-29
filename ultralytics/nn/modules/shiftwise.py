@@ -67,10 +67,15 @@ class ShiftWiseConv(nn.Module):
             nk = math.ceil(big_k / small_k)  # 對於 big_k=13, small_k=3: nk=5
             c_in_expanded = c2 * nk  # 擴展後的輸入通道數
             
-            # 初始化：AddShift_mp_module(big_kernel, small_kernel, c_out, c_in, group_in)
-            # c_out = c2 (輸出通道)
-            # c_in = c_in_expanded = c2 * nk (擴展後的輸入通道)
-            self.shift = shift_module(big_k, small_k, c2, c_in_expanded, group_in=1)
+            # 保存初始化參數，延遲初始化 AddShift_mp_module
+            # 因為 AddShift_mp_module.__init__ 會調用 torch.manual_seed，可能觸發 CUDA 操作
+            # 如果 CUDA 未正確初始化會導致錯誤
+            self._shift_module_class = shift_module
+            self._big_k = big_k
+            self._small_k = small_k
+            self._c2 = c2
+            self._c_in_expanded = c_in_expanded
+            self.shift = None  # 延遲初始化
             self.shift_bn = nn.BatchNorm2d(c2)
             self.nk = nk  # 保存 nk 以便在 forward 中使用
             
@@ -81,9 +86,45 @@ class ShiftWiseConv(nn.Module):
             self.shift_bn = None
             self.nk = None
             self.channel_expand = None
+            self._shift_module_class = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run shiftwise path when CUDA is available, otherwise fallback to standard conv."""
+        # 延遲初始化 AddShift_mp_module（在第一次 forward 時，確保 CUDA 已正確初始化）
+        if self.use_shiftwise and self.shift is None and self._shift_module_class is not None:
+            # 只在 CUDA 輸入時初始化（ShiftWise 需要 CUDA）
+            if x.is_cuda:
+                try:
+                    # 確保 CUDA 已初始化並清除任何之前的錯誤狀態
+                    torch.cuda.synchronize()
+                    # 檢查 CUDA 是否可用
+                    if not torch.cuda.is_available():
+                        raise RuntimeError("CUDA is not available")
+                    
+                    # 現在初始化 AddShift_mp_module
+                    # 注意：AddShift_mp_module.__init__ 會調用 torch.manual_seed，可能觸發 CUDA 操作
+                    self.shift = self._shift_module_class(
+                        self._big_k, self._small_k, self._c2, self._c_in_expanded, group_in=1
+                    )
+                    # 將 shift 模組移到 CUDA
+                    self.shift = self.shift.cuda()
+                except (RuntimeError, Exception) as e:
+                    # 如果初始化失敗，禁用 ShiftWise
+                    error_msg = str(e)
+                    if "CUDA" in error_msg or "cuda" in error_msg.lower() or "illegal" in error_msg.lower():
+                        if not hasattr(self, '_init_warned'):
+                            print(f"⚠️  ShiftWise CUDA module initialization failed: {error_msg}")
+                            print(f"   Falling back to standard convolution")
+                            self._init_warned = True
+                        self.use_shiftwise = False
+                        self.shift = None
+                    else:
+                        raise
+            else:
+                # CPU 輸入，不使用 ShiftWise
+                self.use_shiftwise = False
+                self.shift = None
+        
         # 檢查是否可以使用 ShiftWise CUDA 路徑
         if (
             self.use_shiftwise
