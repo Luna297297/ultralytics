@@ -126,13 +126,19 @@ class ShiftWiseConv(nn.Module):
                 self.shift = None
         
         # 檢查是否可以使用 ShiftWise CUDA 路徑
-        if (
+        use_shiftwise_path = (
             self.use_shiftwise
             and self.shift is not None
             and self.channel_expand is not None
             and x.is_cuda
             and self.stride == 1
-        ):
+        )
+        
+        # 標記：記錄是否使用 ShiftWise 路徑（用於驗證）
+        if not hasattr(self, '_path_used'):
+            self._path_used = None  # None=未使用, 'shiftwise'=使用 ShiftWise, 'fallback'=使用 fallback
+        
+        if use_shiftwise_path:
             # 使用 ShiftWise CUDA 路徑（3x3 kernels + shift pattern 實現等效 big_k）
             b, c, h, w = x.shape
             
@@ -231,6 +237,9 @@ class ShiftWiseConv(nn.Module):
                 # 同步 CUDA 操作以檢查是否有錯誤
                 torch.cuda.synchronize()
                 
+                # 標記：成功使用 ShiftWise 路徑
+                self._path_used = 'shiftwise'
+                
                 return self.act(self.shift_bn(result))
             except (RuntimeError, ValueError) as e:
                 # 如果 CUDA kernel 出錯或尺寸不匹配，fallback 到標準卷積
@@ -240,10 +249,15 @@ class ShiftWiseConv(nn.Module):
                     if not hasattr(self, '_fallback_warned'):
                         print(f"⚠️  ShiftWise CUDA kernel error, falling back to standard conv: {error_msg}")
                         self._fallback_warned = True
+                    # 標記：因為錯誤而使用 fallback
+                    self._path_used = 'fallback'
                     return self.act(self.fallback_bn(self.fallback_conv(x)))
                 else:
                     raise
         else:
             # 使用 fallback 標準卷積（直接使用 big_k x big_k conv）
+            # 標記：使用 fallback 路徑
+            self._path_used = 'fallback'
+            
             return self.act(self.fallback_bn(self.fallback_conv(x)))
 
