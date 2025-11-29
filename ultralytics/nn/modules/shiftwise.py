@@ -221,6 +221,11 @@ class ShiftWiseConv(nn.Module):
         
         if use_shiftwise_path:
             # 使用 ShiftWise CUDA 路徑（3x3 kernels + shift pattern 實現等效 big_k）
+            # 關鍵：確保輸入張量在記憶體中是連續的（PyTorch 2.x 可能產生不連續張量）
+            # 這可以避免 CUDA kernel 的 illegal memory access 錯誤
+            if not x.is_contiguous():
+                x = x.contiguous()
+            
             b, c, h, w = x.shape
             
             # AddShift_mp_module 需要輸入通道數為 c_out * nk
@@ -255,16 +260,10 @@ class ShiftWiseConv(nn.Module):
                         f"got (h={h}, w={w}), hout={hout}, wout={wout}, extra_pad={extra_pad}"
                     )
                 
-                # 確保張量是連續的
-                if not x.is_contiguous():
-                    x = x.contiguous()
-                
                 # 擴展通道數：從 c1 擴展到 c2 * nk
+                # 注意：channel_expand 的輸出可能不連續，必須強制連續
                 x_expanded = self.channel_expand(x)  # (b, c1, h, w) -> (b, c2*nk, h, w)
-                
-                # 確保擴展後的張量是連續的
-                if not x_expanded.is_contiguous():
-                    x_expanded = x_expanded.contiguous()
+                x_expanded = x_expanded.contiguous()  # 強制連續（關鍵：避免 CUDA kernel 記憶體錯誤）
                 
                 # 調用 ShiftWise CUDA kernel
                 # AddShift_mp_module.forward(x, b, hout, wout)
@@ -325,10 +324,14 @@ class ShiftWiseConv(nn.Module):
                         raise RuntimeError(f"CUDA context corrupted after ShiftWise kernel: {error_msg}")
                     raise
                 
-                # 確保輸出張量是連續的
+                # 確保輸出張量是連續的（CUDA kernel 返回的張量可能不連續）
+                # 在相加前確保每個張量都是連續的
+                y1 = y1.contiguous() if not y1.is_contiguous() else y1
+                y2 = y2.contiguous() if not y2.is_contiguous() else y2
+                y3 = y3.contiguous() if not y3.is_contiguous() else y3
+                
                 result = y1 + y2 + y3
-                if not result.is_contiguous():
-                    result = result.contiguous()
+                result = result.contiguous()  # 強制連續
                 
                 # ShiftWise 輸出尺寸會比輸入小 2*extra_pad
                 # 但 YOLO 架構期望輸出尺寸等於輸入尺寸（stride=1, padding=k//2）
