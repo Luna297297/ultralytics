@@ -98,13 +98,6 @@ class ShiftWiseConv(nn.Module):
             # AddShift_mp_module 需要輸入通道數為 c_out * nk
             # 所以我們需要先擴展通道數
             try:
-                # 確保張量是連續的
-                if not x.is_contiguous():
-                    x = x.contiguous()
-                
-                # 擴展通道數：從 c1 擴展到 c2 * nk
-                x_expanded = self.channel_expand(x)  # (b, c1, h, w) -> (b, c2*nk, h, w)
-                
                 # 計算 extra_pad（與 AddShift_mp_module 內部計算一致）
                 # extra_pad = (small_k - 1) - small_k // 2
                 small_k = 3  # 固定為 3
@@ -120,17 +113,82 @@ class ShiftWiseConv(nn.Module):
                 if hout <= 0 or wout <= 0:
                     raise ValueError(f"Invalid output size: hout={hout}, wout={wout} (input: h={h}, w={w})")
                 
+                # AddShift_mp_module 期望輸入尺寸為 (b, c_in, x_hin, x_win)
+                # 其中 x_hin = hout + 2*extra_pad = h, x_win = wout + 2*extra_pad = w
+                # 所以輸入的 h, w 應該等於 x_hin, x_win
+                # 但我們需要確保輸入尺寸正確
+                x_hin_expected = hout + 2 * extra_pad
+                x_win_expected = wout + 2 * extra_pad
+                
+                # 檢查輸入尺寸是否匹配
+                if h != x_hin_expected or w != x_win_expected:
+                    raise ValueError(
+                        f"Input size mismatch: expected (h={x_hin_expected}, w={x_win_expected}), "
+                        f"got (h={h}, w={w}), hout={hout}, wout={wout}, extra_pad={extra_pad}"
+                    )
+                
+                # 確保張量是連續的
+                if not x.is_contiguous():
+                    x = x.contiguous()
+                
+                # 擴展通道數：從 c1 擴展到 c2 * nk
+                x_expanded = self.channel_expand(x)  # (b, c1, h, w) -> (b, c2*nk, h, w)
+                
                 # 確保擴展後的張量是連續的
                 if not x_expanded.is_contiguous():
                     x_expanded = x_expanded.contiguous()
                 
                 # 調用 ShiftWise CUDA kernel
-                y1, y2, y3 = self.shift(x_expanded, b, hout, wout)
+                # AddShift_mp_module.forward(x, b, hout, wout)
+                # 內部會計算 x_hin = hout + 2*extra_pad，應該等於我們的 h
+                try:
+                    y1, y2, y3 = self.shift(x_expanded, b, hout, wout)
+                except RuntimeError as e:
+                    # 如果 CUDA kernel 出錯，提供更詳細的錯誤信息
+                    error_msg = str(e)
+                    if "CUDA" in error_msg or "cuda" in error_msg.lower() or "illegal" in error_msg.lower():
+                        print(f"⚠️  ShiftWise CUDA kernel error:")
+                        print(f"   Input shape: {x_expanded.shape}")
+                        print(f"   Expected input: (b={b}, c_in={self.shift.c_in}, h={x_hin_expected}, w={x_win_expected})")
+                        print(f"   Output size: hout={hout}, wout={wout}")
+                        print(f"   Error: {error_msg}")
+                        raise
+                    else:
+                        raise
+                
+                # 檢查輸出形狀
+                expected_shape = (b, self.shift.c_out, hout, wout)
+                if y1.shape != expected_shape or y2.shape != expected_shape or y3.shape != expected_shape:
+                    raise ValueError(
+                        f"Output shape mismatch: expected {expected_shape}, "
+                        f"got y1={y1.shape}, y2={y2.shape}, y3={y3.shape}"
+                    )
                 
                 # 確保輸出張量是連續的
                 result = y1 + y2 + y3
                 if not result.is_contiguous():
                     result = result.contiguous()
+                
+                # ShiftWise 輸出尺寸會比輸入小 2*extra_pad
+                # 但 YOLO 架構期望輸出尺寸等於輸入尺寸（stride=1, padding=k//2）
+                # 所以我們需要進行 padding 來恢復原始尺寸
+                if hout != h or wout != w:
+                    # 計算需要的 padding
+                    pad_h = (h - hout) // 2
+                    pad_w = (w - wout) // 2
+                    pad_h_remainder = (h - hout) % 2
+                    pad_w_remainder = (w - wout) % 2
+                    
+                    # 進行 padding：pad (left, right, top, bottom)
+                    result = torch.nn.functional.pad(
+                        result,
+                        (pad_w, pad_w + pad_w_remainder, pad_h, pad_h + pad_h_remainder),
+                        mode='constant',
+                        value=0
+                    )
+                
+                # 同步 CUDA 操作以檢查是否有錯誤
+                torch.cuda.synchronize()
                 
                 return self.act(self.shift_bn(result))
             except (RuntimeError, ValueError) as e:
