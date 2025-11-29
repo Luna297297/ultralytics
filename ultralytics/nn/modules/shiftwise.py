@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import torch
 import torch.nn as nn
 
@@ -63,41 +62,57 @@ class ShiftWiseConv(nn.Module):
         # 動態檢查 ShiftWise CUDA 模組是否可用（每次初始化時重新檢查）
         self.use_shiftwise, shift_module = _check_shiftwise_available()
         if self.use_shiftwise and shift_module is not None:
-            self.shift = shift_module(big_k, small_k, c2, c1, group_in=1)
+            # AddShift_mp_module 需要：c_in = c_out * nk，其中 nk = ceil(big_k / small_k)
+            import math
+            nk = math.ceil(big_k / small_k)  # 對於 big_k=13, small_k=3: nk=5
+            c_in_expanded = c2 * nk  # 擴展後的輸入通道數
+            
+            # 初始化：AddShift_mp_module(big_kernel, small_kernel, c_out, c_in, group_in)
+            # c_out = c2 (輸出通道)
+            # c_in = c_in_expanded = c2 * nk (擴展後的輸入通道)
+            self.shift = shift_module(big_k, small_k, c2, c_in_expanded, group_in=1)
             self.shift_bn = nn.BatchNorm2d(c2)
+            self.nk = nk  # 保存 nk 以便在 forward 中使用
+            
+            # 需要一個 1x1 conv 來將輸入從 c1 擴展到 c_in_expanded
+            self.channel_expand = nn.Conv2d(c1, c_in_expanded, 1, 1, 0, bias=False)
         else:
             self.shift = None
             self.shift_bn = None
+            self.nk = None
+            self.channel_expand = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run shiftwise path when CUDA is available, otherwise fallback to standard conv."""
-        # 檢查環境變數：如果設置了 SHIFTWISE_USE_FALLBACK=1，強制使用 fallback
-        force_fallback = os.getenv("SHIFTWISE_USE_FALLBACK", "0") == "1"
-        
         # 檢查是否可以使用 ShiftWise CUDA 路徑
         if (
-            not force_fallback
-            and self.use_shiftwise
+            self.use_shiftwise
             and self.shift is not None
+            and self.channel_expand is not None
             and x.is_cuda
             and self.stride == 1
         ):
             # 使用 ShiftWise CUDA 路徑（3x3 kernels + shift pattern 實現等效 big_k）
             b, c, h, w = x.shape
             
-            # AddShift_mp_module.forward(x, b, hout, wout) 需要輸出尺寸
-            # 內部計算：x_hin = hout + 2*extra_pad
-            # 對於 small_k=3: extra_pad = (3-1) - 3//2 = 1
-            # 所以如果輸入是 h，那麼 hout = h - 2*extra_pad = h - 2
-            # 但實際上，由於我們使用 padding=big_k//2，輸出應該等於輸入
-            # 為了匹配，我們需要傳遞 hout = h - 2*extra_pad
+            # AddShift_mp_module 需要輸入通道數為 c_out * nk
+            # 所以我們需要先擴展通道數
             try:
+                # 確保張量是連續的
+                if not x.is_contiguous():
+                    x = x.contiguous()
+                
+                # 擴展通道數：從 c1 擴展到 c2 * nk
+                x_expanded = self.channel_expand(x)  # (b, c1, h, w) -> (b, c2*nk, h, w)
+                
                 # 計算 extra_pad（與 AddShift_mp_module 內部計算一致）
                 # extra_pad = (small_k - 1) - small_k // 2
                 small_k = 3  # 固定為 3
                 extra_pad = (small_k - 1) - small_k // 2  # = 1
                 
                 # 計算輸出尺寸
+                # AddShift_mp_module 內部：x_hin = hout + 2*extra_pad
+                # 所以 hout = h - 2*extra_pad
                 hout = h - 2 * extra_pad
                 wout = w - 2 * extra_pad
                 
@@ -105,11 +120,12 @@ class ShiftWiseConv(nn.Module):
                 if hout <= 0 or wout <= 0:
                     raise ValueError(f"Invalid output size: hout={hout}, wout={wout} (input: h={h}, w={w})")
                 
-                # 確保張量是連續的（CUDA kernel 要求）
-                if not x.is_contiguous():
-                    x = x.contiguous()
+                # 確保擴展後的張量是連續的
+                if not x_expanded.is_contiguous():
+                    x_expanded = x_expanded.contiguous()
                 
-                y1, y2, y3 = self.shift(x, b, hout, wout)
+                # 調用 ShiftWise CUDA kernel
+                y1, y2, y3 = self.shift(x_expanded, b, hout, wout)
                 
                 # 確保輸出張量是連續的
                 result = y1 + y2 + y3
