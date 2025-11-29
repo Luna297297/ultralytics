@@ -20,7 +20,18 @@ def _check_shiftwise_available():
     try:
         from ops.ops_py.add_shift import AddShift_mp_module
         return True, AddShift_mp_module
-    except Exception:
+    except ImportError as e:
+        # Import 失敗，可能是模組未安裝或未編譯
+        if not hasattr(_check_shiftwise_available, '_import_warned'):
+            print(f"⚠️  ShiftWise CUDA module import failed: {e}")
+            print(f"   請確認 shift-wiseConv 已正確編譯和安裝")
+            _check_shiftwise_available._import_warned = True
+        return False, None
+    except Exception as e:
+        # 其他錯誤
+        if not hasattr(_check_shiftwise_available, '_import_warned'):
+            print(f"⚠️  ShiftWise CUDA module check failed: {type(e).__name__}: {e}")
+            _check_shiftwise_available._import_warned = True
         return False, None
 
 
@@ -59,6 +70,12 @@ class ShiftWiseConv(nn.Module):
         self.fallback_conv = nn.Conv2d(c1, c2, big_k, s, padding, bias=False)
         self.fallback_bn = nn.BatchNorm2d(c2)
 
+        # 保存參數（無論 ShiftWise 是否可用，都需要這些參數以便後續重新檢查）
+        self._big_k = big_k
+        self._small_k = small_k
+        self._c2 = c2
+        self._c1 = c1
+
         # 動態檢查 ShiftWise CUDA 模組是否可用（每次初始化時重新檢查）
         self.use_shiftwise, shift_module = _check_shiftwise_available()
         if self.use_shiftwise and shift_module is not None:
@@ -71,9 +88,6 @@ class ShiftWiseConv(nn.Module):
             # 因為 AddShift_mp_module.__init__ 會調用 torch.manual_seed，可能觸發 CUDA 操作
             # 如果 CUDA 未正確初始化會導致錯誤
             self._shift_module_class = shift_module
-            self._big_k = big_k
-            self._small_k = small_k
-            self._c2 = c2
             self._c_in_expanded = c_in_expanded
             self.shift = None  # 延遲初始化
             self.shift_bn = nn.BatchNorm2d(c2)
@@ -82,14 +96,39 @@ class ShiftWiseConv(nn.Module):
             # 需要一個 1x1 conv 來將輸入從 c1 擴展到 c_in_expanded
             self.channel_expand = nn.Conv2d(c1, c_in_expanded, 1, 1, 0, bias=False)
         else:
+            # ShiftWise 不可用，但保存參數以便後續重新檢查
             self.shift = None
             self.shift_bn = None
             self.nk = None
             self.channel_expand = None
             self._shift_module_class = None
+            self._c_in_expanded = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run shiftwise path when CUDA is available, otherwise fallback to standard conv."""
+        # 重新檢查 ShiftWise 是否可用（可能在 __init__ 時不可用，但現在可用了）
+        if not self.use_shiftwise or self._shift_module_class is None:
+            # 如果之前不可用，現在重新檢查
+            use_shiftwise_new, shift_module = _check_shiftwise_available()
+            if use_shiftwise_new and shift_module is not None:
+                # 現在可用，設置參數
+                import math
+                nk = math.ceil(self._big_k / self._small_k)
+                c_in_expanded = self._c2 * nk
+                self._shift_module_class = shift_module
+                self._c_in_expanded = c_in_expanded
+                self.nk = nk
+                self.use_shiftwise = True
+                if not hasattr(self, 'shift_bn') or self.shift_bn is None:
+                    self.shift_bn = nn.BatchNorm2d(self._c2)
+                if not hasattr(self, 'channel_expand') or self.channel_expand is None:
+                    self.channel_expand = nn.Conv2d(
+                        self._c1, c_in_expanded, 1, 1, 0, bias=False
+                    )
+                if not hasattr(self, '_reinit_warned'):
+                    print(f"✅ ShiftWise CUDA 模組現在可用，已啟用 ShiftWise 路徑")
+                    self._reinit_warned = True
+        
         # 延遲初始化 AddShift_mp_module（在第一次 forward 時，確保 CUDA 已正確初始化）
         if self.use_shiftwise and self.shift is None and self._shift_module_class is not None:
             # 只在 CUDA 輸入時初始化（ShiftWise 需要 CUDA）
@@ -103,25 +142,57 @@ class ShiftWiseConv(nn.Module):
                     
                     # 現在初始化 AddShift_mp_module
                     # 注意：AddShift_mp_module.__init__ 會調用 torch.manual_seed，可能觸發 CUDA 操作
-                    self.shift = self._shift_module_class(
-                        self._big_k, self._small_k, self._c2, self._c_in_expanded, group_in=1
-                    )
-                    # 將 shift 模組移到 CUDA
-                    self.shift = self.shift.cuda()
+                    # 使用 CUDA_LAUNCH_BLOCKING 來獲取更詳細的錯誤信息
+                    import os
+                    old_blocking = os.environ.get("CUDA_LAUNCH_BLOCKING", "0")
+                    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"  # 臨時啟用以獲取詳細錯誤
+                    
+                    try:
+                        self.shift = self._shift_module_class(
+                            self._big_k, self._small_k, self._c2, self._c_in_expanded, group_in=1
+                        )
+                        # 將 shift 模組移到 CUDA
+                        self.shift = self.shift.cuda()
+                    finally:
+                        # 恢復原來的設置
+                        os.environ["CUDA_LAUNCH_BLOCKING"] = old_blocking
+                    
                 except (RuntimeError, Exception) as e:
-                    # 如果初始化失敗，禁用 ShiftWise
+                    # 如果初始化失敗，禁用 ShiftWise 並打印詳細錯誤
                     error_msg = str(e)
-                    if "CUDA" in error_msg or "cuda" in error_msg.lower() or "illegal" in error_msg.lower():
-                        if not hasattr(self, '_init_warned'):
-                            print(f"⚠️  ShiftWise CUDA module initialization failed: {error_msg}")
-                            print(f"   Falling back to standard convolution")
-                            self._init_warned = True
-                        self.use_shiftwise = False
-                        self.shift = None
-                    else:
-                        raise
+                    error_type = type(e).__name__
+                    
+                    # 總是打印第一次失敗的詳細信息（每個模組實例）
+                    if not hasattr(self, '_init_warned'):
+                        print(f"\n{'='*60}")
+                        print(f"⚠️  ShiftWise CUDA module initialization failed")
+                        print(f"{'='*60}")
+                        print(f"Module: {self.__class__.__name__}")
+                        print(f"Error type: {error_type}")
+                        print(f"Error message: {error_msg}")
+                        print(f"Parameters: big_k={self._big_k}, small_k={self._small_k}, c2={self._c2}, c_in_expanded={self._c_in_expanded}")
+                        print(f"CUDA available: {torch.cuda.is_available()}")
+                        if torch.cuda.is_available():
+                            print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+                            print(f"CUDA version: {torch.version.cuda}")
+                        print(f"PyTorch version: {torch.__version__}")
+                        print(f"\n可能的原因:")
+                        print(f"1. shift-wiseConv CUDA kernel 編譯問題")
+                        print(f"2. CUDA/PyTorch 版本不相容")
+                        print(f"3. CUDA 上下文損壞")
+                        print(f"4. 記憶體不足")
+                        print(f"\n將使用 fallback 標準卷積")
+                        print(f"{'='*60}\n")
+                        self._init_warned = True
+                        self._init_error = error_msg  # 保存錯誤信息以便後續查詢
+                    
+                    self.use_shiftwise = False
+                    self.shift = None
             else:
                 # CPU 輸入，不使用 ShiftWise
+                if not hasattr(self, '_cpu_warned'):
+                    print(f"⚠️  Input is on CPU, ShiftWise requires CUDA. Using fallback.")
+                    self._cpu_warned = True
                 self.use_shiftwise = False
                 self.shift = None
         
