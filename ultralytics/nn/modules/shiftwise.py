@@ -139,9 +139,9 @@ class ShiftWiseConv(nn.Module):
                 print(f"⚠️  ShiftWiseConv: stride={self.stride} > 1, using fallback (13x13 conv)")
                 self._fallback_warned = True
             return self.act(self.fallback_bn(self.fallback_conv(x)))
-            
-            b, c, h, w = x.shape
-            
+        
+        b, c, h, w = x.shape
+        
         # Step 1: Channel expansion
         x_expanded = self.channel_expand(x)  # (b, c1, h, w) -> (b, c2*nk, h, w)
         
