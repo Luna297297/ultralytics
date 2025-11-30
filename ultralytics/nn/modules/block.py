@@ -36,6 +36,7 @@ __all__ = (
     "C2fAttn",
     "C2fCIB",
     "C2fPSA",
+    "C2f_SW",
     "C3Ghost",
     "C3k2",
     "BottleneckSW",
@@ -1170,6 +1171,42 @@ class C3k2_SW(C2f):
                 BottleneckSW(self.c, self.c, shortcut, e=1.0, big_k=big_k, replace_both=replace_both)
                 for _ in range(n)
             )
+
+
+class C2f_SW(C2f):
+    """C2f variant backed by ShiftWise bottlenecks with configurable big_k.
+    
+    This module allows per-stage configuration of big_k (equivalent large kernel size)
+    for YOLOv8. Different stages should use different big_k values to achieve
+    hierarchical receptive fields.
+    
+    Args:
+        c1: Input channels
+        c2: Output channels
+        n: Number of bottleneck blocks
+        shortcut: Whether to use shortcut connections
+        e: Expansion ratio
+        big_k: Equivalent large kernel size for ShiftWise (must be >> 3, paper uses 13-51)
+        replace_both: If True, replace both conv layers in each bottleneck with ShiftWiseConv
+    """
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        shortcut: bool = False,
+        e: float = 0.5,
+        big_k: int = 13,
+        replace_both: bool = True,
+    ):
+        """Initialize ShiftWise-enabled C2f module with configurable big_k."""
+        super().__init__(c1, c2, n, shortcut, g=1, e=e)
+        # Replace standard Bottleneck with BottleneckSW
+        self.m = nn.ModuleList(
+            BottleneckSW(self.c, self.c, shortcut, e=1.0, big_k=big_k, replace_both=replace_both)
+            for _ in range(n)
+        )
 
 
 class C3k(C3):

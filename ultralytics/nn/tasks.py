@@ -37,6 +37,7 @@ from ultralytics.nn.modules import (
     C3Ghost,
     C3k2,
     C3k2_SW,
+    C2f_SW,
     C3x,
     CBFuse,
     CBLinear,
@@ -1537,6 +1538,7 @@ def parse_model(d, ch, verbose=True):
             C1,
             C2,
             C2f,
+            C2f_SW,
             C3k2,
             C3k2_SW,
             RepNCSPELAN4,
@@ -1564,6 +1566,7 @@ def parse_model(d, ch, verbose=True):
             C1,
             C2,
             C2f,
+            C2f_SW,
             C3k2,
             C3k2_SW,
             C2fAttn,
@@ -1626,6 +1629,64 @@ def parse_model(d, ch, verbose=True):
                     # Add replace_both if not present
                     if len(args) < 9:
                         args.append(True)  # replace_both (default)
+            # For C2f_SW: handle optional big_k and replace_both parameters
+            if m is C2f_SW:
+                # After parse_model processing:
+                # - args starts as [c2, shortcut, ...] from YAML
+                # - args becomes [c1, c2, shortcut, ...] after args = [c1, c2, *args[1:]]
+                # - args becomes [c1, c2, n, shortcut, ...] after args.insert(2, n) in repeat_modules
+                # C2f_SW.__init__ signature: (c1, c2, n, shortcut, e, big_k, replace_both)
+                # So we need: [c1, c2, n, shortcut, e, big_k, replace_both]
+                
+                # Ensure we have at least [c1, c2, n, shortcut]
+                while len(args) < 4:
+                    if len(args) == 3:
+                        args.append(False)  # shortcut (default for C2f)
+                
+                # Check if args[3] (after n insertion) is shortcut or big_k
+                # If args[3] is an int/float > 3, it's likely big_k, not shortcut
+                # Otherwise, it's shortcut (bool)
+                if len(args) >= 4:
+                    # If args[3] is a number > 3, it's big_k, need to insert shortcut and e
+                    if isinstance(args[3], (int, float)) and args[3] > 3:
+                        # args = [c1, c2, n, big_k, ...]
+                        # Need: [c1, c2, n, shortcut, e, big_k, replace_both]
+                        args.insert(3, False)  # Insert shortcut
+                        args.insert(4, 0.5)  # Insert e
+                    elif len(args) == 4:
+                        # args = [c1, c2, n, shortcut]
+                        # Need: [c1, c2, n, shortcut, e, big_k, replace_both]
+                        args.append(0.5)  # e (default expansion ratio)
+                        args.append(13)  # big_k (default)
+                        args.append(True)  # replace_both (default)
+                    elif len(args) == 5:
+                        # args = [c1, c2, n, shortcut, e] or [c1, c2, n, shortcut, big_k]
+                        # Check if args[4] is e (float ~0.5) or big_k (int > 3)
+                        if isinstance(args[4], (int, float)) and args[4] > 3:
+                            # args = [c1, c2, n, shortcut, big_k]
+                            args.insert(4, 0.5)  # Insert e
+                            args.append(True)  # replace_both (default)
+                        else:
+                            # args = [c1, c2, n, shortcut, e]
+                            args.append(13)  # big_k (default)
+                            args.append(True)  # replace_both (default)
+                    elif len(args) == 6:
+                        # args = [c1, c2, n, shortcut, e, big_k] or [c1, c2, n, shortcut, big_k, replace_both]
+                        if isinstance(args[5], (int, float)) and args[5] > 3:
+                            # args = [c1, c2, n, shortcut, e, big_k]
+                            args.append(True)  # replace_both (default)
+                        else:
+                            # args = [c1, c2, n, shortcut, e, replace_both] - unlikely but handle it
+                            args.insert(5, 13)  # Insert big_k before replace_both
+                
+                # Ensure big_k is valid (must be > 3 per paper)
+                if len(args) >= 7:
+                    if not isinstance(args[6], (int, float)) or args[6] <= 3:
+                        args[6] = 13  # Ensure big_k > 3
+                
+                # Ensure replace_both is present
+                if len(args) < 8:
+                    args.append(True)  # replace_both (default)
             if m is A2C2f:
                 legacy = False
                 if scale in "lx":  # for L/X sizes
