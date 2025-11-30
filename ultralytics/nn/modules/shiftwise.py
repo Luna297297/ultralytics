@@ -45,7 +45,7 @@ class ShiftWiseConv(nn.Module):
         self._small_k = small_k
         self._c2 = c2
         self._c1 = c1
-        
+
         # Calculate nk: number of small kernels needed to simulate big_k
         nk = math.ceil(big_k / small_k)  # For big_k=13, small_k=3: nk=5
         self.nk = nk
@@ -86,6 +86,12 @@ class ShiftWiseConv(nn.Module):
         # Mark as pure PyTorch implementation
         self._path_used = 'pytorch'
         self.use_pytorch = True
+        
+        # 為每個模組分配 ID（用於日誌識別）
+        if not hasattr(ShiftWiseConv, '_instance_count'):
+            ShiftWiseConv._instance_count = 0
+        ShiftWiseConv._instance_count += 1
+        self._module_id = ShiftWiseConv._instance_count
 
     def _generate_shift_patterns(self, big_k: int, small_k: int, nk: int):
         """Generate shift patterns to simulate large kernel receptive field.
@@ -122,20 +128,27 @@ class ShiftWiseConv(nn.Module):
            - Sum the results
         3. Merge paths: sum all path outputs
         4. Channel mixing: c2 -> c2
+        
+        This implementation uses 3x3 depthwise convolutions with spatial shifts
+        to simulate the effect of a large kernel (big_k x big_k).
         """
         if self.stride != 1:
             # Stride > 1 not supported, use fallback
+            self._path_used = 'fallback'
+            if not hasattr(self, '_fallback_warned'):
+                print(f"⚠️  ShiftWiseConv: stride={self.stride} > 1, using fallback (13x13 conv)")
+                self._fallback_warned = True
             return self.act(self.fallback_bn(self.fallback_conv(x)))
-        
-        b, c, h, w = x.shape
-        
+            
+            b, c, h, w = x.shape
+            
         # Step 1: Channel expansion
         x_expanded = self.channel_expand(x)  # (b, c1, h, w) -> (b, c2*nk, h, w)
         
         # Reshape to separate channels: (b, c2*nk, h, w) -> (b, c2, nk, h, w)
         x_reshaped = x_expanded.view(b, self._c2, self.nk, h, w)
         
-        # Step 2: Process each path
+        # Step 2: Process each path (3 paths, each with nk=5 shifts + 3x3 convs)
         path_outputs = []
         for path_idx in range(self.num_paths):
             path_conv = self.path_convs[path_idx]
@@ -146,13 +159,14 @@ class ShiftWiseConv(nn.Module):
                 # Get the corresponding channel group
                 x_group = x_reshaped[:, :, shift_idx, :, :]  # (b, c2, h, w)
                 
-                # Apply spatial shift
+                # Apply spatial shift (this is the key to simulating large kernel)
                 if shift_h != 0 or shift_w != 0:
                     x_shifted = torch.roll(x_group, shifts=(shift_h, shift_w), dims=(2, 3))
-                else:
+                    else:
                     x_shifted = x_group
                 
-                # Apply 3x3 depthwise convolution
+                # Apply 3x3 depthwise convolution (groups=c2 means depthwise)
+                # This is the core: using 3x3 small kernels instead of 13x13 large kernel
                 x_conv = path_conv[shift_idx](x_shifted)  # (b, c2, h, w)
                 path_results.append(x_conv)
             
@@ -167,7 +181,23 @@ class ShiftWiseConv(nn.Module):
         output = self.channel_mix(merged)  # (b, c2, h, w)
         output = self.bn(output)
         
-        # Mark path used
+        # Mark path used (for verification)
         self._path_used = 'pytorch'
+        
+        # Track forward count (for verification)
+        if not hasattr(self, '_forward_count'):
+            self._forward_count = 0
+        self._forward_count += 1
+        
+        # 訓練時輸出驗證資訊（只在第一次或每 N 次輸出）
+        if self.training:
+            if not hasattr(self, '_training_logged') or self._forward_count % 100 == 0:
+                if not hasattr(self, '_training_logged'):
+                    # 第一次訓練時輸出
+                    module_id = getattr(self, '_module_id', 'unknown')
+                    print(f"✅ ShiftWiseConv[{module_id}] 訓練中: 使用 3×3 kernels 模擬 {self._big_k}×{self._big_k}")
+                    print(f"   配置: {self.num_paths} paths × {self.nk} shifts × 3×3 depthwise convs")
+                    print(f"   輸入: {x.shape} -> 輸出: {output.shape}")
+                    self._training_logged = True
         
         return self.act(output)
