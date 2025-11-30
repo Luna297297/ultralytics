@@ -1660,14 +1660,20 @@ def parse_model(d, ch, verbose=True):
                         args.append(13)  # big_k (default)
                         args.append(True)  # replace_both (default)
                     elif len(args) == 5:
-                        # args = [c1, c2, n, shortcut, e] or [c1, c2, n, shortcut, big_k]
-                        # Check if args[4] is e (float ~0.5) or big_k (int > 3)
+                        # args = [c1, c2, n, shortcut, big_k] (YAML: [c2, shortcut, big_k])
+                        # Check if args[4] is big_k (int > 3) - most likely case from YAML
                         if isinstance(args[4], (int, float)) and args[4] > 3:
                             # args = [c1, c2, n, shortcut, big_k]
-                            args.insert(4, 0.5)  # Insert e
+                            # Need: [c1, c2, n, shortcut, e, big_k, replace_both]
+                            args.insert(4, 0.5)  # Insert e before big_k
+                            args.append(True)  # replace_both (default)
+                        elif isinstance(args[4], (int, float)) and 0 < args[4] <= 1:
+                            # args[4] is e (float ~0.5)
+                            # args = [c1, c2, n, shortcut, e]
+                            args.append(13)  # big_k (default)
                             args.append(True)  # replace_both (default)
                         else:
-                            # args = [c1, c2, n, shortcut, e]
+                            # Unknown, assume it's e and add big_k and replace_both
                             args.append(13)  # big_k (default)
                             args.append(True)  # replace_both (default)
                     elif len(args) == 6:
@@ -1680,13 +1686,43 @@ def parse_model(d, ch, verbose=True):
                             args.insert(5, 13)  # Insert big_k before replace_both
                 
                 # Ensure big_k is valid (must be > 3 per paper)
-                if len(args) >= 7:
-                    if not isinstance(args[6], (int, float)) or args[6] <= 3:
-                        args[6] = 13  # Ensure big_k > 3
+                # After processing, args should be: [c1, c2, n, shortcut, e, big_k, replace_both]
+                # big_k is at index 5, replace_both is at index 6
+                if len(args) >= 6:
+                    # Check if args[5] is big_k (int > 3)
+                    if isinstance(args[5], (int, float)) and args[5] > 3:
+                        # args[5] is big_k, good
+                        pass
+                    elif len(args) >= 5 and isinstance(args[4], (int, float)) and args[4] > 3:
+                        # args[4] is big_k, need to insert e before it
+                        args.insert(4, 0.5)  # Insert e
+                        if len(args) < 7:
+                            args.append(True)  # replace_both
+                    else:
+                        # big_k not found, add it
+                        if len(args) == 5:
+                            args.append(13)  # big_k
+                        elif len(args) == 6:
+                            args.insert(5, 13)  # Insert big_k before replace_both
+                        if len(args) < 7:
+                            args.append(True)  # replace_both
+                else:
+                    # Not enough args, add defaults
+                    while len(args) < 5:
+                        args.append(False if len(args) == 3 else 0.5 if len(args) == 4 else 13)
+                    args.append(True)  # replace_both
                 
-                # Ensure replace_both is present
-                if len(args) < 8:
-                    args.append(True)  # replace_both (default)
+                # Final validation: ensure big_k > 3
+                if len(args) >= 6 and isinstance(args[5], (int, float)) and args[5] <= 3:
+                    args[5] = 13
+                
+                # Ensure we have exactly 7 args: [c1, c2, n, shortcut, e, big_k, replace_both]
+                if len(args) > 7:
+                    args = args[:7]  # Trim to 7 args
+                elif len(args) < 7:
+                    # Add missing args
+                    if len(args) == 6:
+                        args.append(True)  # replace_both
             if m is A2C2f:
                 legacy = False
                 if scale in "lx":  # for L/X sizes
