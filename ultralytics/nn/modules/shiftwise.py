@@ -162,7 +162,7 @@ class ShiftWiseConv(nn.Module):
                 # Apply spatial shift (this is the key to simulating large kernel)
                 if shift_h != 0 or shift_w != 0:
                     x_shifted = torch.roll(x_group, shifts=(shift_h, shift_w), dims=(2, 3))
-                    else:
+                else:
                     x_shifted = x_group
                 
                 # Apply 3x3 depthwise convolution (groups=c2 means depthwise)
